@@ -65,8 +65,7 @@ def download_daily_prices(tickers: tuple[str, ...], start_date: date) -> pd.Data
     if raw is None or raw.empty:
         return pd.DataFrame()
     if isinstance(raw.columns, pd.MultiIndex):
-        level0 = set(raw.columns.get_level_values(0))
-        level1 = set(raw.columns.get_level_values(1))
+        level0, level1 = set(raw.columns.get_level_values(0)), set(raw.columns.get_level_values(1))
         frames = {}
         for ticker in tickers:
             if ticker in level0:
@@ -116,12 +115,9 @@ def add_indicators(bars: pd.DataFrame, sma_length: int, atr_length: int, factor:
     atr = true_range.ewm(alpha=1 / atr_length, adjust=False, min_periods=atr_length).mean()
     midpoint = (high + low) / 2
     basic_upper, basic_lower = midpoint + factor * atr, midpoint - factor * atr
-
     count = len(df)
-    final_upper = np.full(count, np.nan)
-    final_lower = np.full(count, np.nan)
-    supertrend = np.full(count, np.nan)
-    is_green = np.zeros(count, dtype=bool)
+    final_upper, final_lower = np.full(count, np.nan), np.full(count, np.nan)
+    supertrend, is_green = np.full(count, np.nan), np.zeros(count, dtype=bool)
     upper_values, lower_values, close_values = basic_upper.to_numpy(), basic_lower.to_numpy(), close.to_numpy()
 
     for i in range(count):
@@ -145,7 +141,6 @@ def add_indicators(bars: pd.DataFrame, sma_length: int, atr_length: int, factor:
             supertrend[i] = final_upper[i]
 
     df["supertrend"], df["st_green"] = supertrend, is_green
-
     window = pivot_bars * 2 + 1
     rolling_high = high.rolling(window, center=True, min_periods=window).max()
     confirmed_pivot = high.where(high.eq(rolling_high)).shift(pivot_bars).ffill()
@@ -173,46 +168,138 @@ def confirmation_mask(df: pd.DataFrame, mode: str) -> pd.Series:
     return tc_buy | df["green_arrow"]
 
 
-def run_backtest(df: pd.DataFrame, ticker: str, timeframe: str, confirm_mode: str) -> tuple[list[dict], pd.DataFrame]:
+def run_backtest(
+    df: pd.DataFrame,
+    ticker: str,
+    timeframe: str,
+    confirm_mode: str,
+    investment_per_trade: float,
+    activation_pct: float,
+    trail_pct: float,
+) -> tuple[list[dict], pd.DataFrame]:
+    """Breakout entries; after +activation%, stop rises to breakeven then trails peak."""
     out = df.copy()
     if out.empty:
         return [], out
     out["confirmation"] = confirmation_mask(out, confirm_mode)
     out["setup"] = out["st_green"] & out["confirmation"]
     out["breakout"] = False
-    trades, position = [], None
+    trades: list[dict] = []
+    position: dict | None = None
+
+    def finish_trade(exit_date, exit_price, reason, bar_index):
+        nonlocal position
+        shares = position["shares"]
+        invested = position["invested_amount"]
+        pnl = (float(exit_price) - position["entry_price"]) * shares
+        trades.append({
+            **position,
+            "exit_date": exit_date,
+            "exit_price": float(exit_price),
+            "exit_reason": reason,
+            "status": "CLOSED",
+            "holding_bars": bar_index - position["entry_bar"],
+            "holding_days": (exit_date.date() - position["entry_date"].date()).days,
+            "pnl_per_share": float(exit_price) - position["entry_price"],
+            "pnl_rupees": pnl,
+            "return_pct": pnl / invested * 100 if invested else 0.0,
+            "max_trailing_stop": position["max_trailing_stop"],
+            "trailing_activated": position["trailing_activated"],
+        })
+        position = None
 
     for i in range(1, len(out)):
         row, previous = out.iloc[i], out.iloc[i - 1]
-        if position is not None and not bool(row["st_green"]):
-            exit_price, exit_date = float(row["Close"]), out.index[i]
-            trades.append({
-                **position, "exit_date": exit_date, "exit_price": exit_price, "status": "CLOSED",
-                "holding_bars": i - position["entry_bar"],
-                "holding_days": (exit_date.date() - position["entry_date"].date()).days,
-                "pnl_per_share": exit_price - position["entry_price"],
-                "return_pct": (exit_price / position["entry_price"] - 1) * 100,
-            })
-            position = None
+
+        if position is not None:
+            # Apply the stop known from the previous completed bar first. This avoids
+            # using today's high to invent a stop that was hit earlier the same day.
+            active_stop = position["active_stop"]
+            if float(row["Open"]) <= active_stop:
+                finish_trade(out.index[i], float(row["Open"]), "Trailing/initial stop (gap)", i)
+                continue
+            if float(row["Low"]) <= active_stop:
+                finish_trade(out.index[i], active_stop, "Trailing/initial stop", i)
+                continue
+
+            st_line = row["supertrend"]
+            if (not bool(row["st_green"])) or (pd.notna(st_line) and float(row["Close"]) < float(st_line)):
+                finish_trade(out.index[i], float(row["Close"]), "Supertrend red / close below line", i)
+                continue
+
+            # Update the high-water mark after checking the previously active stop.
+            position["peak_price"] = max(position["peak_price"], float(row["High"]))
+            if position["peak_price"] >= position["entry_price"] * (1 + activation_pct / 100):
+                position["trailing_activated"] = True
+                # At +2.5%, protect entry price. Above that, trail 2.5% below
+                # the highest traded high, never allowing the stop below entry.
+                position["active_stop"] = max(
+                    position["entry_price"],
+                    position["peak_price"] * (1 - trail_pct / 100),
+                )
+                position["max_trailing_stop"] = max(
+                    position["max_trailing_stop"], position["active_stop"]
+                )
+            else:
+                # Before activation, the protective stop follows the green Supertrend line.
+                if pd.notna(st_line) and bool(row["st_green"]):
+                    position["active_stop"] = max(position["active_stop"], float(st_line))
+                    position["max_trailing_stop"] = max(
+                        position["max_trailing_stop"], position["active_stop"]
+                    )
             continue
+
+        # Any later fresh setup can create another trade after the previous trade exits.
         trigger_level = float(previous["High"])
-        triggered = position is None and bool(previous["setup"]) and bool(row["st_green"]) and float(row["High"]) > trigger_level
+        triggered = (
+            bool(previous["setup"])
+            and bool(row["st_green"])
+            and float(row["High"]) > trigger_level
+        )
         out.iat[i, out.columns.get_loc("breakout")] = triggered
-        if triggered:
-            position = {
-                "ticker": ticker, "timeframe": timeframe, "entry_date": out.index[i],
-                "entry_price": max(float(row["Open"]), trigger_level),
-                "trigger_level": trigger_level, "entry_bar": i,
-            }
+        if not triggered:
+            continue
+
+        entry_price = max(float(row["Open"]), trigger_level)
+        shares = int(investment_per_trade // entry_price) if entry_price > 0 else 0
+        if shares < 1:
+            continue
+        initial_st = row["supertrend"]
+        initial_stop = float(initial_st) if pd.notna(initial_st) and float(initial_st) < entry_price else entry_price * 0.95
+        position = {
+            "ticker": ticker,
+            "timeframe": timeframe,
+            "entry_date": out.index[i],
+            "entry_price": entry_price,
+            "trigger_level": trigger_level,
+            "shares": shares,
+            "invested_amount": shares * entry_price,
+            "entry_bar": i,
+            "initial_stop": initial_stop,
+            "active_stop": initial_stop,
+            "peak_price": entry_price,
+            "trailing_activated": False,
+            "max_trailing_stop": initial_stop,
+        }
 
     if position is not None:
         last, mark = out.iloc[-1], float(out.iloc[-1]["Close"])
+        shares, invested = position["shares"], position["invested_amount"]
+        pnl = (mark - position["entry_price"]) * shares
         trades.append({
-            **position, "exit_date": pd.NaT, "exit_price": np.nan, "status": "OPEN",
+            **position,
+            "exit_date": pd.NaT,
+            "exit_price": np.nan,
+            "exit_reason": "OPEN (marked to latest close)",
+            "status": "OPEN",
             "holding_bars": len(out) - 1 - position["entry_bar"],
             "holding_days": (out.index[-1].date() - position["entry_date"].date()).days,
             "pnl_per_share": mark - position["entry_price"],
-            "return_pct": (mark / position["entry_price"] - 1) * 100, "mark_price": mark,
+            "pnl_rupees": pnl,
+            "return_pct": pnl / invested * 100 if invested else 0.0,
+            "mark_price": mark,
+            "max_trailing_stop": position["max_trailing_stop"],
+            "trailing_activated": position["trailing_activated"],
         })
     return trades, out
 
@@ -258,6 +345,9 @@ with st.sidebar:
     atr_length = st.number_input("Supertrend ATR length", min_value=1, value=15)
     factor = st.number_input("Supertrend factor", min_value=0.01, value=3.0, step=0.1)
     pivot_bars = st.number_input("Structure pivot bars", min_value=1, value=2)
+    investment_per_trade = st.number_input("Investment per trade (₹)", min_value=1000, value=5000, step=1000)
+    activation_pct = st.number_input("Profit gain to move stop to entry (%)", min_value=0.1, value=2.5, step=0.1)
+    trail_pct = st.number_input("Trail below peak after activation (%)", min_value=0.1, value=2.5, step=0.1)
     years = st.selectbox("Backtest history (years)", [1, 2, 3, 5], index=3)
     uploaded = st.file_uploader("Optional constituents CSV/XLSX", type=["csv", "xlsx"])
 
@@ -298,7 +388,10 @@ for symbol_index, ticker in enumerate(tickers):
             if len(bars) < max(int(sma_length), int(atr_length)) + int(pivot_bars) * 2 + 5:
                 continue
             indicators = add_indicators(bars, int(sma_length), int(atr_length), float(factor), int(pivot_bars))
-            trades, tested = run_backtest(indicators, ticker, timeframe, confirm_mode)
+            trades, tested = run_backtest(
+                indicators, ticker, timeframe, confirm_mode,
+                float(investment_per_trade), float(activation_pct), float(trail_pct),
+            )
             all_trades.extend(trades)
             tested_by_ticker_timeframe[(ticker, timeframe)] = tested
             latest = tested.iloc[-1]
@@ -328,7 +421,7 @@ m2.metric("Stocks with a setup", int((scan["Status"] != "—").sum()))
 if not trades.empty:
     closed = trades[trades["status"] == "CLOSED"]
     m3.metric("Closed backtest trades", len(closed))
-    m4.metric("Win rate", f"{(closed['return_pct'] > 0).mean() * 100:.1f}%" if len(closed) else "—")
+    m4.metric("Win rate", f"{(closed['pnl_rupees'] > 0).mean() * 100:.1f}%" if len(closed) else "—")
 else:
     m3.metric("Closed backtest trades", 0)
     m4.metric("Win rate", "—")
@@ -339,22 +432,52 @@ st.dataframe(setups.sort_values(["Timeframe", "Status", "Stock"]), use_container
 with st.expander("Show all scanned stocks"):
     st.dataframe(scan.sort_values(["Timeframe", "Stock"]), use_container_width=True, hide_index=True)
 
-st.subheader("🧪 Backtest trades")
+st.subheader("🧪 Backtest trades and trailing stops")
+st.caption("After a 2.5% rise from entry, the stop moves to breakeven. If price keeps rising, stop trails 2.5% below the highest bar high. Trades may re-enter on later fresh setups after an exit. Monthly figures group realized closed trades by exit month.")
 if trades.empty:
     st.info("No trades were generated for the selected settings.")
 else:
     display_trades = trades.copy()
     for column in ("entry_date", "exit_date"):
         display_trades[column] = pd.to_datetime(display_trades[column], errors="coerce").dt.strftime("%Y-%m-%d")
-    shown = [c for c in ["ticker", "timeframe", "entry_date", "entry_price", "trigger_level", "exit_date", "exit_price", "status", "holding_bars", "holding_days", "pnl_per_share", "return_pct", "mark_price"] if c in display_trades.columns]
+    shown = [c for c in [
+        "ticker", "timeframe", "entry_date", "entry_price", "shares", "invested_amount",
+        "initial_stop", "max_trailing_stop", "trailing_activated", "peak_price",
+        "exit_date", "exit_price", "exit_reason", "status", "holding_bars",
+        "holding_days", "pnl_rupees", "return_pct", "mark_price",
+    ] if c in display_trades.columns]
     st.dataframe(display_trades[shown].sort_values(["entry_date", "ticker"], ascending=False), use_container_width=True, hide_index=True)
-    closed = trades[trades["status"] == "CLOSED"]
+
+    closed = trades[trades["status"] == "CLOSED"].copy()
     if not closed.empty:
+        closed["exit_month"] = pd.to_datetime(closed["exit_date"]).dt.to_period("M").astype(str)
+        monthly = closed.groupby("exit_month", as_index=False).agg(
+            trades_closed=("ticker", "count"),
+            winning_trades=("pnl_rupees", lambda x: int((x > 0).sum())),
+            losing_trades=("pnl_rupees", lambda x: int((x <= 0).sum())),
+            invested_capital=("invested_amount", "sum"),
+            realized_pnl=("pnl_rupees", "sum"),
+        )
+        monthly["monthly_return_pct"] = np.where(
+            monthly["invested_capital"] > 0,
+            monthly["realized_pnl"] / monthly["invested_capital"] * 100,
+            0,
+        )
+        monthly = monthly.rename(columns={
+            "exit_month": "Month", "trades_closed": "Trades closed",
+            "winning_trades": "Winning trades", "losing_trades": "Losing trades",
+            "invested_capital": "Invested capital (₹)", "realized_pnl": "Realized P/L (₹)",
+            "monthly_return_pct": "Return on closed-trade capital (%)",
+        })
+        st.subheader("📅 Monthly backtest results")
+        st.dataframe(monthly.sort_values("Month", ascending=False), use_container_width=True, hide_index=True)
+        total_pnl = float(closed["pnl_rupees"].sum())
+        win_rate = float((closed["pnl_rupees"] > 0).mean() * 100)
         a, b, c = st.columns(3)
-        a.metric("Sum of trade returns*", f"{closed['return_pct'].sum():.2f}%")
-        b.metric("Average trade return", f"{closed['return_pct'].mean():.2f}%")
-        c.metric("Closed-trade win rate", f"{(closed['return_pct'] > 0).mean() * 100:.1f}%")
-        st.caption("*Returns exclude fees, taxes, slippage, liquidity, and position sizing.")
+        a.metric("Closed-trade net P/L", f"₹{total_pnl:,.2f}")
+        b.metric("Average closed-trade P/L", f"₹{closed['pnl_rupees'].mean():,.2f}")
+        c.metric("Closed-trade win rate", f"{win_rate:.1f}%")
+        st.caption("Monthly return is realized P/L divided by the sum of ₹5,000-based invested amounts for trades exiting that month. It is not a compounded portfolio return. Fees, taxes, and slippage are excluded.")
 
 st.subheader("📈 Stock chart and news")
 available_tickers = sorted({ticker for ticker, _ in tested_by_ticker_timeframe})
@@ -370,9 +493,7 @@ if available_tickers:
         fig.add_trace(go.Scatter(x=chart_bars.index, y=chart_bars["supertrend"].where(~green), name="Supertrend red", mode="lines", line={"color": "#dc2626", "width": 2}))
         fig.update_layout(height=550, xaxis_rangeslider_visible=False, template="plotly_dark", legend_orientation="h")
         st.plotly_chart(fig, use_container_width=True)
-
     st.subheader("📰 Stock news")
-    st.caption("Recent news headlines matching this stock symbol. Availability depends on Google News indexing.")
     with st.spinner("Looking for recent news…"):
         stock_news = fetch_stock_news(selected_ticker)
     if not stock_news:
